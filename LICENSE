@@ -1,10 +1,6 @@
 The MIT License (MIT)
 
 Copyright (c) 2026 AMin Aliu
-
-This engine is a Rust port of Pokemon Showdown's battle simulator and includes
-data and logic derived from it:
-
 Copyright (c) 2011-2026 Guangcong Luo and other contributors http://pokemonshowdown.com/
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of
