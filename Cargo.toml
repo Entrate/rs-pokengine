@@ -1,0 +1,35 @@
+[package]
+name = "engine"
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+description = "Rust battle engine for Pokemon Showdown Gen 9 Random Doubles"
+repository = "https://github.com/Entrate/rs-pokengine"
+
+[dependencies]
+
+[features]
+trace-hooks = []
+event-probes = []
+event-trace = ["trace-hooks"]
+# Assert that every Pokemon named in the protocol is marked in `revealed_mons` (determinization).
+reveal-audit = []
+# Fair-information search support (`search` module, PRNG resample hook). Off by default: the
+# hook adds a counter and a compare to every PRNG draw and 152 bytes to `BattleState`.
+search = []
+
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "thin"
+debug = "line-tables-only"
+
+[profile.bench]
+inherits = "release"

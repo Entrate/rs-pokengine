@@ -1,0 +1,404 @@
+//! Showdown packed team input; allocations are confined to this input boundary.
+use crate::{dex, ids::*};
+use std::sync::Arc;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Gender {
+    #[default]
+    Unspecified,
+    Male,
+    Female,
+    Genderless,
+}
+impl Gender {
+    pub fn protocol(self) -> &'static str {
+        match self {
+            Self::Male => "M",
+            Self::Female => "F",
+            _ => "",
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SetDef {
+    pub name: String,
+    pub species: EffectId,
+    pub item: EffectId,
+    pub ability: EffectId,
+    pub moves: [EffectId; 4],
+    pub move_count: u8,
+    pub evs: [u8; 6],
+    pub ivs: [u8; 6],
+    pub nature: i8,
+    pub level: u16,
+    pub gender: Gender,
+    pub shiny: bool,
+    pub happiness: u8,
+    pub tera_type: TypeId,
+    pub pokeball: String,
+    pub hp_type: String,
+    pub dynamax_level: u8,
+    pub gigantamax: bool,
+}
+impl Default for SetDef {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            species: EffectId::NONE,
+            item: EffectId::NONE,
+            ability: EffectId::NONE,
+            moves: [EffectId::NONE; 4],
+            move_count: 0,
+            evs: [0; 6],
+            ivs: [31; 6],
+            nature: -1,
+            level: 100,
+            gender: Gender::Unspecified,
+            shiny: false,
+            happiness: 255,
+            tera_type: TypeId::NONE,
+            pokeball: "pokeball".into(),
+            hp_type: String::new(),
+            dynamax_level: 10,
+            gigantamax: false,
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TeamDef {
+    pub sets: [SetDef; 6],
+    pub len: u8,
+}
+impl Default for TeamDef {
+    fn default() -> Self {
+        Self {
+            sets: core::array::from_fn(|_| SetDef::default()),
+            len: 0,
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TeamDefs {
+    pub sides: [Arc<TeamDef>; 2],
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TeamError(pub String);
+impl core::fmt::Display for TeamError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for TeamError {}
+fn lookup(kind: EffectKind, text: &str) -> Result<EffectId, TeamError> {
+    dex::lookup(kind, text)
+        .ok_or_else(|| TeamError(format!("Unknown or out-of-scope {kind:?}: {text}")))
+}
+fn number(text: &str, default: f64) -> f64 {
+    if text.is_empty() {
+        return default;
+    }
+    let text = text.trim();
+    if text.is_empty() {
+        return 0.0;
+    }
+    let radix = if text.starts_with("0x") || text.starts_with("0X") {
+        Some(16)
+    } else if text.starts_with("0b") || text.starts_with("0B") {
+        Some(2)
+    } else if text.starts_with("0o") || text.starts_with("0O") {
+        Some(8)
+    } else {
+        None
+    };
+    if let Some(radix) = radix {
+        return u64::from_str_radix(&text[2..], radix).map_or(0.0, |n| n as f64);
+    }
+    match text.parse::<f64>() {
+        Ok(n) if !n.is_nan() => n,
+        _ => 0.0,
+    }
+}
+fn vector(text: &str, default: u8, max: u8) -> [u8; 6] {
+    let mut values = [default; 6];
+    if !text.is_empty() {
+        let mut parts = text.split(',');
+        for v in &mut values {
+            let n = parts.next().map_or(0.0, |s| number(s, default as f64));
+            *v = n.floor().clamp(0.0, max as f64) as u8;
+        }
+    }
+    values
+}
+// Teams.unpack uses parseInt rather than Number for level.
+fn level(text: &str) -> u16 {
+    let mut s = text.trim_start();
+    let negative = s.starts_with('-');
+    if s.starts_with(['+', '-']) {
+        s = &s[1..];
+    }
+    let radix = if s.starts_with("0x") || s.starts_with("0X") {
+        s = &s[2..];
+        16
+    } else {
+        10
+    };
+    let mut value = 0u32;
+    let mut seen = false;
+    for c in s.chars() {
+        let Some(d) = c.to_digit(radix) else { break };
+        seen = true;
+        value = value.saturating_mul(radix).saturating_add(d);
+    }
+    if !seen || value == 0 {
+        100
+    } else if negative {
+        1
+    } else {
+        value.min(9999) as u16
+    }
+}
+fn truncate_utf16(text: &str, n: usize) -> String {
+    let mut count = 0;
+    text.chars()
+        .take_while(|c| {
+            count += c.len_utf16();
+            count <= n
+        })
+        .collect()
+}
+impl TeamDef {
+    /// Check typed input before constructors index the generated dex tables.
+    pub fn validate(&self) -> Result<(), TeamError> {
+        if !(1..=6).contains(&self.len) {
+            return Err(TeamError("A parsed team must contain 1..=6 Pokemon".into()));
+        }
+        for set in &self.sets[..self.len as usize] {
+            set.validate()?;
+        }
+        Ok(())
+    }
+
+    pub fn unpack(packed: &str) -> Result<Self, TeamError> {
+        if packed.is_empty() {
+            return Err(TeamError("Explicit packed teams must be nonempty".into()));
+        }
+        let mut team = Self::default();
+        for (index, record) in packed.split(']').enumerate() {
+            if index >= 6 {
+                return Err(TeamError("This format supports at most six Pokemon".into()));
+            }
+            let mut fields = record.splitn(12, '|');
+            let mut f = [""; 12];
+            for field in &mut f {
+                *field = fields
+                    .next()
+                    .ok_or_else(|| TeamError(format!("Malformed packed set {}", index + 1)))?;
+            }
+            let species = lookup(
+                EffectKind::Species,
+                if f[1].is_empty() { f[0] } else { f[1] },
+            )?;
+            let s = dex::species(species);
+            // Teams.unpack expands packed species names before constructor name comparison.
+            let input_species = if f[1].is_empty() { f[0] } else { s.name };
+            let name = if f[0].is_empty() || f[0] == input_species {
+                s.base_species_name
+            } else {
+                f[0]
+            };
+            let set = &mut team.sets[index];
+            set.species = species;
+            set.name = truncate_utf16(name, 20);
+            if !f[2].is_empty() {
+                set.item = lookup(EffectKind::Item, f[2])?
+            }
+            let slot = match f[3] {
+                "" | "0" => Some(0),
+                "1" => Some(1),
+                "H" => Some(2),
+                "S" => Some(3),
+                _ => None,
+            };
+            if let Some(slot) = slot {
+                let a = s.abilities[slot];
+                if !a.key.is_empty() {
+                    set.ability = lookup(EffectKind::Ability, a.key)?
+                } else if !f[3].is_empty() {
+                    return Err(TeamError("Unavailable ability slot".into()));
+                }
+            } else {
+                set.ability = lookup(EffectKind::Ability, f[3])?
+            }
+            for (i, m) in f[4].split(',').enumerate() {
+                if i >= 4 {
+                    return Err(TeamError("This format supports at most four moves".into()));
+                }
+                set.moves[i] = lookup(EffectKind::Move, m)?;
+                set.move_count += 1;
+            }
+            if !f[5].is_empty() {
+                let normalized: String = f[5]
+                    .bytes()
+                    .filter(u8::is_ascii_alphanumeric)
+                    .map(|b| b.to_ascii_lowercase() as char)
+                    .collect();
+                set.nature = dex::NATURES
+                    .iter()
+                    .position(|n| n.key == normalized)
+                    .map_or(-1, |n| n as i8);
+            }
+            set.evs = vector(f[6], 0, 255);
+            set.ivs = vector(f[8], 31, 31);
+            set.gender = match f[7] {
+                "M" => Gender::Male,
+                "F" => Gender::Female,
+                "N" => Gender::Genderless,
+                _ => Gender::Unspecified,
+            };
+            set.shiny = !f[9].is_empty();
+            set.level = level(f[10]);
+            let mut misc_fields = f[11].split(',');
+            let mut misc = [""; 6];
+            for field in &mut misc {
+                *field = misc_fields.next().unwrap_or("");
+            }
+            set.happiness = number(misc[0], 255.0).floor().clamp(0.0, 255.0) as u8;
+            set.hp_type = misc[1].to_string();
+            if !misc[2].is_empty() {
+                let ball = misc[2];
+                set.pokeball = ball
+                    .bytes()
+                    .filter(u8::is_ascii_alphanumeric)
+                    .map(|b| b.to_ascii_lowercase() as char)
+                    .collect();
+            }
+            set.gigantamax = !misc[3].is_empty();
+            set.dynamax_level = number(misc[4], 10.0).floor().clamp(0.0, 10.0) as u8;
+            set.tera_type = if !misc[5].is_empty() {
+                let t = misc[5];
+                dex::type_id(t).ok_or_else(|| TeamError(format!("Unknown Tera type {t}")))?
+            } else {
+                s.types[0]
+            };
+            team.len += 1;
+        }
+        Ok(team)
+    }
+}
+
+impl TeamDef {
+    /// Showdown packed text that `unpack` parses back to this team (species, ability and item
+    /// written by id, tera type and level always explicit). A name equal to a forme's full
+    /// species name comes back as the base species name, as `Teams.unpack` does.
+    pub fn pack(&self) -> String {
+        let mut out = String::new();
+        for (i, set) in self.sets[..self.len as usize].iter().enumerate() {
+            if i > 0 {
+                out.push(']');
+            }
+            set.pack_into(&mut out);
+        }
+        out
+    }
+}
+
+impl SetDef {
+    fn pack_into(&self, out: &mut String) {
+        use core::fmt::Write;
+        let key = |id: EffectId| if id == EffectId::NONE { "" } else { dex::effect(id).key };
+        let stats = |values: &[u8; 6], default: u8| {
+            if values.iter().all(|&v| v == default) {
+                String::new()
+            } else {
+                values.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")
+            }
+        };
+        let moves: Vec<&str> = self.moves[..self.move_count as usize].iter().map(|&m| key(m)).collect();
+        let nature = if self.nature >= 0 { dex::NATURES[self.nature as usize].key } else { "" };
+        let gender = match self.gender {
+            Gender::Male => "M",
+            Gender::Female => "F",
+            Gender::Genderless => "N",
+            Gender::Unspecified => "",
+        };
+        let _ = write!(
+            out,
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{},{},{},{},{},{}",
+            self.name,
+            key(self.species),
+            key(self.item),
+            key(self.ability),
+            moves.join(","),
+            nature,
+            stats(&self.evs, 0),
+            gender,
+            stats(&self.ivs, 31),
+            if self.shiny { "S" } else { "" },
+            self.level,
+            if self.happiness == 255 { String::new() } else { self.happiness.to_string() },
+            self.hp_type,
+            if self.pokeball == "pokeball" { "" } else { &self.pokeball },
+            if self.gigantamax { "G" } else { "" },
+            if self.dynamax_level == 10 { String::new() } else { self.dynamax_level.to_string() },
+            dex::TYPE_NAMES[self.tera_type.0 as usize - 1],
+        );
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), TeamError> {
+        let in_table = |id: EffectId, kind| {
+            let table = dex::table(kind);
+            table.first().is_some_and(|first| id.0 >= first.id.0)
+                && table.last().is_some_and(|last| id.0 <= last.id.0)
+        };
+        if !in_table(self.species, EffectKind::Species)
+            || (self.ability != EffectId::NONE && !in_table(self.ability, EffectKind::Ability))
+            || (self.item != EffectId::NONE && !in_table(self.item, EffectKind::Item))
+            || !(1..=4).contains(&self.move_count)
+            || self.moves[..self.move_count as usize]
+                .iter()
+                .any(|&m| !in_table(m, EffectKind::Move))
+            || self.nature < -1
+            || self.nature as isize >= dex::NATURES.len() as isize
+            || self.level == 0
+            || self.ivs.iter().any(|&iv| iv > 31)
+            // TypeIds are one-based; packed sets accept every generated name, including "???".
+            || !(1..=dex::TYPE_NAMES.len()).contains(&(self.tera_type.0 as usize))
+        {
+            return Err(TeamError("Invalid typed set definition".into()));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tera_validation_tests {
+    use super::*;
+
+    #[test]
+    fn typed_tera_domain_matches_packed_parsing() {
+        let team = TeamDef::unpack("Pikachu||lightball|static|thunderbolt|Serious||M|||100|,,,,,???").unwrap();
+        let set = team.sets[0].clone();
+        assert_eq!(set.tera_type, dex::TYPE_UNKNOWN);
+        assert!(set.validate().is_ok());
+        for (tera, ok) in [(0, false), (1, true), (dex::TYPE_STELLAR.0, true), (dex::TYPE_UNKNOWN.0, true), (21, false)] {
+            let set = SetDef { tera_type: TypeId(tera), ..set.clone() };
+            assert_eq!(set.validate().is_ok(), ok, "tera {tera}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod pack_tests {
+    use super::*;
+
+    #[test]
+    fn pack_round_trips_through_unpack() {
+        for packed in [
+            "Muk|MukAlola|SitrusBerry|PoisonTouch|poisonjab,helpinghand,knockoff,drainpunch||85,85,85,85,85,85|M|||82|,,,,,Flying]Mesprit||LifeOrb|Levitate|protect,psychic,nastyplot,dazzlinggleam||85,,85,85,85,85|N|,0,,,,||86|,,,,,Psychic",
+            "Pikachu||lightball|static|thunderbolt|Serious||M|||100|,,,,,Electric",
+            "Snorlax||leftovers|thickfat|bodyslam,curse|Adamant|252,4,,,,252||,,,,,0|S|50|128,,,,,???",
+        ] {
+            let team = TeamDef::unpack(packed).unwrap();
+            assert_eq!(TeamDef::unpack(&team.pack()).unwrap(), team, "{}", team.pack());
+        }
+    }
+}
